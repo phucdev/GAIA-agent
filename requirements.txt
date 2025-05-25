@@ -1,7 +1,9 @@
 beautifulsoup4==4.13.4
 datasets==3.5.1
 duckduckgo-search==8.0.1
+faiss-cpu==1.11.0
 gradio==5.29.0
+hf_xet==1.1.2
 huggingface-hub==0.30.2
 langchain==0.3.25
 langchain-community==0.3.23
@@ -9,6 +11,7 @@ langchain-core==0.3.58
 langchain_groq==0.3.2
 langchain-huggingface==0.1.2
 langchain-openai==0.3.16
+langfuse==2.60.5
 langgraph==0.4.1
 numpy==2.2.5
 openai-whisper==20240930

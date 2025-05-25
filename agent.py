@@ -1,10 +1,12 @@
-from typing import Annotated, Optional, TypedDict
+from typing import Annotated, TypedDict
 
 from dotenv import find_dotenv, load_dotenv
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import AnyMessage, HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
+from langfuse.callback import CallbackHandler
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import create_react_agent
+from langgraph.graph import START, StateGraph
+from langgraph.prebuilt import ToolNode, tools_condition
 
 from tools import (add, ask_about_image, divide, get_current_time_and_date,
                    get_sum, get_weather_info, get_youtube_transcript,
@@ -14,26 +16,27 @@ from tools import (add, ask_about_image, divide, get_current_time_and_date,
 
 
 class AgentState(TypedDict):
-    input_file: Optional[str]  # Contains file path
-    messages: Annotated[list[AnyMessage], add_messages]
+    messages: Annotated[list, add_messages]
 
 
 class BasicAgent:
     def __init__(self):
         load_dotenv(find_dotenv())
-        model = init_chat_model("groq:meta-llama/llama-4-scout-17b-16e-instruct")
+        llm = init_chat_model("groq:meta-llama/llama-4-scout-17b-16e-instruct")
         system_prompt = (
-            "You are a general AI assistant. I will ask you a question. Report your thoughts, and finish your answer "
-            "with the following template: FINAL ANSWER: [YOUR FINAL ANSWER]. YOUR FINAL ANSWER should be a number OR "
-            "as few words as possible OR a comma separated list of numbers and/or strings. If you are asked for a "
-            "number, don't use comma to write your number neither use units such as $ or percent sign unless specified "
-            "otherwise. If you are asked for a string, don't use articles, neither abbreviations (e.g. for cities), "
-            "and write the digits in plain text unless specified otherwise. If you are asked for a comma separated "
-            "list, apply the above rules depending of whether the element to be put in the list is a number or a string."
-            "Give it all you can: I know for a fact that you have access to all the relevant tools to solve it and find "
-            "the correct answer (the answer does exist). Failure or 'I cannot answer' or 'None found' will not be "
-            "tolerated, success will be rewarded. Run verification steps if that's needed, you must make sure you find "
-            "the correct answer! "
+            "You are a powerful general AI assistant designed to answer challenging questions using reasoning and tools.\n"
+            "Each question has a correct answer, and you are expected to find it.\n"
+            "Use all available tools — including calculator, search, or other domain-specific utilities — to verify your work or retrieve information.\n"
+            "If a question requires computation or external data, you must call the appropriate tool.\n"
+            "Think through the problem step by step, then clearly state your final answer using this format:\n"
+            "FINAL ANSWER: [YOUR FINAL ANSWER]\n\n"
+            "Your final answer must follow these rules:\n"
+            "- If the answer is a number, do not use commas or units (unless explicitly requested).\n"
+            "- If the answer is a string, use as few words as possible and do not use articles, abbreviations, or numeric digits.\n"
+            "- If the answer is a comma-separated list, follow the above rules for each element.\n"
+            "- If the answer is a string and unless you are asked to provide a list, capitalize the first letter of the final answer.\n"
+            "Do not say “I cannot answer” or “no answer found”. Success is mandatory. "
+            "You have access to everything you need to solve this."
         )
         tools = [
             get_weather_info,
@@ -52,14 +55,32 @@ class BasicAgent:
             get_youtube_video_info,
             get_youtube_transcript,
         ]
+        llm_with_tools = llm.bind_tools(tools)
 
-        self.agent = create_react_agent(model=model, tools=tools, prompt=system_prompt)
+        def assistant(state: AgentState):
+            sys_msg = SystemMessage(content=system_prompt)
+            return {"messages": llm_with_tools.invoke([sys_msg] + state["messages"])}
+
+        graph_builder = StateGraph(AgentState)
+
+        graph_builder.add_node("assistant", assistant)
+        graph_builder.add_node("tools", ToolNode(tools))
+
+        graph_builder.add_edge(START, "assistant")
+        graph_builder.add_conditional_edges(
+            "assistant",
+            tools_condition,
+        )
+        graph_builder.add_edge("tools", "assistant")
+
+        self.agent = graph_builder.compile()
+        self.langfuse_handler = CallbackHandler()
         print("BasicAgent initialized.")
 
     def __call__(self, question: str) -> str:
         print(f"Agent received question (first 50 chars): {question[:50]}...")
         messages = [HumanMessage(content=question)]
-        response = self.agent.invoke({"messages": messages})
-        response_string = response["messages"][-1].content
+        state = self.agent.invoke({"messages": messages}, config={"callbacks": [self.langfuse_handler]})
+        response_string = state["messages"][-1].content
         print(f"Agent's response: {response_string}")
         return response_string

@@ -1,12 +1,15 @@
 import base64
 import os
-from datetime import datetime
+from typing import Optional
 
 import pandas as pd
 import requests
 import whisper
-import wikipedia
+
+from bs4 import BeautifulSoup
+from datetime import datetime
 from dotenv import find_dotenv, load_dotenv
+from langchain.chains import RetrievalQA
 from langchain.chat_models import init_chat_model
 from langchain_community.document_loaders import (
     UnstructuredPDFLoader, UnstructuredPowerPointLoader,
@@ -14,13 +17,26 @@ from langchain_community.document_loaders import (
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
+from langchain.schema import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+from markdownify import markdownify as md
 from youtube_transcript_api import YouTubeTranscriptApi
 from yt_dlp import YoutubeDL
 
 
+UNWANTED_SECTIONS = {
+    "references",
+    "external links",
+    "further reading",
+    "see also",
+    "notes",
+}
+
 @tool
 def get_weather_info(location: str) -> str:
-    """Fetches dummy weather information for a given location.
+    """Fetches weather information for a given location.
 
     Usage:
     ```
@@ -127,20 +143,127 @@ def reverse_text(text: str) -> str:
     return text[::-1]
 
 
-@tool
-def wiki_search(query: str) -> str:
-    """Searches Wikipedia for a given query and returns the summary.
+def build_retriever(text: str):
+    """Builds a retriever from the given text.
+
+    Args:
+        text (str): The text to be used for retrieval.
+    """
+    splitter = RecursiveCharacterTextSplitter(
+        separators=["\n### ", "\n## ", "\n# "],
+        chunk_size=1000,
+        chunk_overlap=200,
+    )
+    chunks = splitter.split_text(text)
+    docs = [
+        Document(page_content=chunk)
+        for chunk in chunks
+    ]
+    hf_embed = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+    index = FAISS.from_documents(docs, hf_embed)
+    return index.as_retriever(search_kwargs={"k": 3})
+
+
+def get_retrieval_qa(text: str):
+    """Creates a RetrievalQA instance for the given text.
+    Args:
+        text (str): The text to be used for retrieval.
+    """
+    retriever = build_retriever(text)
+    llm = init_chat_model("groq:meta-llama/llama-4-scout-17b-16e-instruct")
+    return RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=retriever,
+        return_source_documents=True,
+    )
+
+
+def clean_html(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1. Remove <script> & <style>
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+
+    # 2. Drop whole <section> blocks whose first heading is unwanted
+    for sec in soup.find_all("section"):
+        h = sec.find(["h1","h2","h3","h4","h5","h6"])
+        if h and any(h.get_text(strip=True).lower().startswith(u) for u in UNWANTED_SECTIONS):
+            sec.decompose()
+
+    # 3. Additional filtering by CSS selector
+    for selector in [".toc", ".navbox", ".vertical-navbox", ".hatnote", ".reflist", ".mw-references-wrap"]:
+        for el in soup.select(selector):
+            el.decompose()
+
+    # 4. Isolate the main content container if present
+    main = soup.find("div", class_="mw-parser-output")
+    return str(main or soup)
+
+
+def get_wikipedia_article(query: str, lang: str = "en") -> str:
+    """Fetches a Wikipedia article for a given query and returns its content in Markdown format.
 
     Args:
         query (str): The search query.
+        lang (str): The language code for the search. Default is "en".
     """
-    search_results = wikipedia.search(query)
-    if not search_results:
+    headers = {
+        'User-Agent': 'MyLLMAgent (llm_agent@example.com)'
+    }
+
+    # Step 1: Search
+    search_url = f"https://api.wikimedia.org/core/v1/wikipedia/{lang}/search/page"
+    search_params = {'q': query, 'limit': 1}
+    search_response = requests.get(search_url, headers=headers, params=search_params, timeout=15)
+
+    if search_response.status_code != 200:
+        return f"Search error: {search_response.status_code}"
+
+    results = search_response.json().get("pages", [])
+    if not results:
         return "No results found."
-    page_title = search_results[0]
-    summary = wikipedia.summary(page_title)
-    # Alternatively wikipedia.page(page_title).content[:max_length]
-    return f"Title: {page_title}\n\nSummary: {summary}"
+
+    page = results[0]
+    page_key = page["key"]
+
+    # Step 2: Get the wiki page, only keep relevant content and convert to Markdown
+    content_url = f"https://api.wikimedia.org/core/v1/wikipedia/{lang}/page/{page_key}/html"
+    content_response = requests.get(content_url, timeout=15)
+
+    if content_response.status_code != 200:
+        return f"Content fetch error: {content_response.status_code}"
+
+    html = clean_html(content_response.text)
+
+    markdown = md(
+        html,
+        heading_style="ATX",
+        bullets="*+-",
+        table_infer_header=True,
+        strip=['a', 'span']
+    )
+    return markdown
+
+
+@tool
+def wiki_search(query: str, question: str, lang: str="en") -> str:
+    """Searches Wikipedia for a specific article and answers a question based on its content.
+
+    The function retrieves a Wikipedia article based on the provided query, converts it to Markdown,
+    and uses a retrieval-based QA system to answer the specified question.
+
+    Args:
+        query (str): A concise topic name with optional keywords, ideally matching the relevant Wikipedia page title.
+        question (str): The question to answer using the article.
+        lang (str): Language code for the Wikipedia edition to search (default: "en").
+    """
+    markdown = get_wikipedia_article(query, lang)
+    qa = get_retrieval_qa(markdown)
+    return qa.invoke(question)
 
 
 @tool
@@ -243,7 +366,7 @@ def ask_about_image(image_path: str, question: str) -> str:
         question (str): Your question about the image, as a natural language sentence. Provide as much context as possible.
     """
     load_dotenv(find_dotenv())
-    llm = init_chat_model("groq:meta-llama/llama-4-scout-17b-16e-instruct")
+    llm = init_chat_model("groq:meta-llama/llama-4-maverick-17b-128e-instruct")
     prompt = ChatPromptTemplate(
         [
             {
@@ -256,16 +379,26 @@ def ask_about_image(image_path: str, question: str) -> str:
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": "data:image/jpeg;base64,{base64_image}",
+                            "url": "data:image/{image_format};base64,{base64_image}",
                         },
                     },
                 ],
             }
         ]
     )
+    file_suffix = os.path.splitext(image_path)[-1]
+    if file_suffix == ".png":
+        image_format = "png"
+    else:
+        # We could handle other formats explicitly, but for simplicity we assume JPEG
+        image_format = "jpeg"
     chain = prompt | llm
     response = chain.invoke(
-        {"question": question, "base64_image": encode_image(image_path)}
+        {
+            "question": question,
+            "base64_image": encode_image(image_path),
+            "image_format": image_format,
+        }
     )
     return response.text()
 
@@ -322,6 +455,7 @@ def inspect_file_as_text(file_path: str) -> str:
     Args:
         file_path (str): The path to the file you want to read as text. If it is an image, use `vision_qa` tool.
     """
+    # TODO we could also pass the file content to a retrieval chain
     try:
         suffix = os.path.splitext(file_path)[-1]
         if suffix in [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff"]:
