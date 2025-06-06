@@ -1,6 +1,8 @@
 import base64
+import json
 import os
-from typing import Optional
+import re
+from typing import Optional, Dict
 
 import pandas as pd
 import requests
@@ -11,16 +13,18 @@ from datetime import datetime
 from dotenv import find_dotenv, load_dotenv
 from langchain.chains import RetrievalQA
 from langchain.chat_models import init_chat_model
+from langchain.schema import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import (
     UnstructuredPDFLoader, UnstructuredPowerPointLoader,
     UnstructuredWordDocumentLoader, WebBaseLoader)
-from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_community.tools import DuckDuckGoSearchResults, GoogleSearchResults
+from langchain_community.utilities import GoogleSerperAPIWrapper
+from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
-from langchain.schema import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+from langchain_tavily import TavilySearch
 from markdownify import markdownify as md
 from youtube_transcript_api import YouTubeTranscriptApi
 from yt_dlp import YoutubeDL
@@ -204,40 +208,16 @@ def clean_html(html: str) -> str:
     return str(main or soup)
 
 
-def get_wikipedia_article(query: str, lang: str = "en") -> str:
-    """Fetches a Wikipedia article for a given query and returns its content in Markdown format.
-
+def fetch_page_markdown(page_key: str, lang: str="en") -> str:
+    """Fetches the page HTML and returns the <body> as Markdown.
     Args:
-        query (str): The search query.
-        lang (str): The language code for the search. Default is "en".
+        page_key (str): The unique key of the Wikipedia page.
+        lang (str): The language code for the Wikipedia edition to fetch (default: "en").
     """
-    headers = {
-        'User-Agent': 'MyLLMAgent (llm_agent@example.com)'
-    }
-
-    # Step 1: Search
-    search_url = f"https://api.wikimedia.org/core/v1/wikipedia/{lang}/search/page"
-    search_params = {'q': query, 'limit': 1}
-    search_response = requests.get(search_url, headers=headers, params=search_params, timeout=15)
-
-    if search_response.status_code != 200:
-        return f"Search error: {search_response.status_code}"
-
-    results = search_response.json().get("pages", [])
-    if not results:
-        return "No results found."
-
-    page = results[0]
-    page_key = page["key"]
-
-    # Step 2: Get the wiki page, only keep relevant content and convert to Markdown
-    content_url = f"https://api.wikimedia.org/core/v1/wikipedia/{lang}/page/{page_key}/html"
-    content_response = requests.get(content_url, timeout=15)
-
-    if content_response.status_code != 200:
-        return f"Content fetch error: {content_response.status_code}"
-
-    html = clean_html(content_response.text)
+    url = f"https://api.wikimedia.org/core/v1/wikipedia/{lang}/page/{page_key}/html"
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    html = clean_html(resp.text)    # Optional, but recommended: clean the HTML to remove unwanted sections
 
     markdown = md(
         html,
@@ -249,8 +229,73 @@ def get_wikipedia_article(query: str, lang: str = "en") -> str:
     return markdown
 
 
+def get_wikipedia_article(query: str) -> Dict[str, str]:
+    """Fetches a Wikipedia article for a given query and returns its content in Markdown format.
+
+    Args:
+        query (str): The search query.
+    """
+    headers = {
+        'User-Agent': 'MyLLMAgent (llm_agent@example.com)'
+    }
+
+    # Step 1: Search
+    search_url = f"https://api.wikimedia.org/core/v1/wikipedia/en/search/page"
+    search_params = {'q': query, 'limit': 1}
+    search_response = requests.get(search_url, headers=headers, params=search_params, timeout=15)
+
+    if search_response.status_code != 200:
+        raise Exception(f"Search error: {search_response.status_code} - {search_response.text}")
+
+    results = search_response.json().get("pages", [])
+    if not results:
+        raise Exception(f"No results found for query: {query}")
+
+    page = results[0]
+    page_key = page["key"]
+
+    # Step 2: Get the wiki page, only keep relevant content and convert to Markdown
+    markdown = fetch_page_markdown(page_key)
+    return {
+        "page_key": page_key,
+        "markdown": markdown,
+    }
+
+
+def parse_sections(markdown_text: str) -> Dict[str, Dict]:
+    """
+    Parses markdown into a nested dict:
+    { section_title: {
+         "full": full_section_md,
+         "subsections": { sub_title: sub_md, ... }
+      }, ... }
+    """
+    # First split top-level sections
+    top_pat = re.compile(r"^##\s+(.*)$", re.MULTILINE)
+    top_matches = list(top_pat.finditer(markdown_text))
+    sections: Dict[str, Dict] = {}
+    for i, m in enumerate(top_matches):
+        sec_title = m.group(1).strip()
+        start = m.start()
+        end = top_matches[i+1].start() if i+1 < len(top_matches) else len(markdown_text)
+        sec_md = markdown_text[start:end].strip()
+
+        # Now split subsections within this block
+        sub_pat = re.compile(r"^###\s+(.*)$", re.MULTILINE)
+        subs: Dict[str, str] = {}
+        sub_matches = list(sub_pat.finditer(sec_md))
+        for j, sm in enumerate(sub_matches):
+            sub_title = sm.group(1).strip()
+            sub_start = sm.start()
+            sub_end = sub_matches[j+1].start() if j+1 < len(sub_matches) else len(sec_md)
+            subs[sub_title] = sec_md[sub_start:sub_end].strip()
+
+        sections[sec_title] = {"full": sec_md, "subsections": subs}
+    return sections
+
+
 @tool
-def wiki_search(query: str, question: str, lang: str="en") -> str:
+def wiki_search_qa(query: str, question: str) -> str:
     """Searches Wikipedia for a specific article and answers a question based on its content.
 
     The function retrieves a Wikipedia article based on the provided query, converts it to Markdown,
@@ -259,22 +304,101 @@ def wiki_search(query: str, question: str, lang: str="en") -> str:
     Args:
         query (str): A concise topic name with optional keywords, ideally matching the relevant Wikipedia page title.
         question (str): The question to answer using the article.
-        lang (str): Language code for the Wikipedia edition to search (default: "en").
     """
-    markdown = get_wikipedia_article(query, lang)
+    article = get_wikipedia_article(query)
+    markdown = article["markdown"]
     qa = get_retrieval_qa(markdown)
     return qa.invoke(question)
 
 
 @tool
-def web_search(query: str) -> str:
-    """Searches the web for a given query and returns the first result.
+def wiki_search_article(query: str) -> str:
+    """Search Wikipedia and return page_key plus a full table of contents (sections + subsections).
+
+    Args:
+        query (str): A concise topic name with optional keywords, ideally matching the relevant Wikipedia page title.
+    """
+    article = get_wikipedia_article(query)
+    page_key = article["page_key"]
+    markdown = article["markdown"]
+    sections = parse_sections(markdown)
+    toc = [
+        {"section": sec, "subsections": list(info["subsections"].keys())}
+        for sec, info in sections.items()
+    ]
+    return json.dumps({"page_key": page_key, "toc": toc})
+
+
+@tool
+def wiki_get_section(
+    page_key: str, section: str, subsection: Optional[str] = None
+) -> str:
+    """
+    Fetches the Markdown for a given top-level section or an optional subsection.
+
+    Args:
+        page_key: the article’s key (from wiki_search)
+        section: one of the top-level headings (## ...)
+        subsection: an optional subheading (### ...) under that section
+
+    Returns:
+        Markdown string of either the entire section or just the named subsection.
+    """
+    page_key = page_key.strip().replace(" ", "_")
+    markdown = fetch_page_markdown(page_key)
+    sections = parse_sections(markdown)
+
+    sec_info = sections.get(section)
+    if not sec_info:
+        return f"Error: section '{section}' not found."
+
+    if subsection:
+        sub_md = sec_info["subsections"].get(subsection)
+        if not sub_md:
+            return f"Error: subsection '{subsection}' not found under '{section}'."
+        return sub_md
+
+    # no subsection requested → return the full section (with all its subsections)
+    return sec_info["full"]
+
+
+@tool
+def web_search(query: str, max_results: int = 5) -> str:
+    """Searches the web for a given query and returns relevant results.
 
     Args:
         query (str): The search query.
+        max_results (int): The maximum number of results to return. Default is 5.
     """
-    search_tool = DuckDuckGoSearchRun()
-    results = search_tool.invoke(query)
+    if os.getenv("SERPER_API_KEY"):
+        # Preferred choice: Use Google Serper API for search
+        search_tool = GoogleSerperAPIWrapper()
+        results_dict = search_tool.results(query)
+        results = "\n".join(
+            [
+                f"Title: {result['title']}\n"
+                f"URL: {result['link']}\n"
+                f"Content: {result['snippet']}\n"
+                for result in results_dict["organic"][:max_results]
+            ]
+        )
+    elif os.getenv("TAVILY_API_KEY"):
+        search_tool = TavilySearch(
+            max_results=max_results,
+            topic="general",
+        )
+        results_dict = search_tool.invoke(query)
+        results = "\n".join(
+            [
+                f"Title: {result['title']}\n"
+                f"URL: {result['url']}\n"
+                f"Content: {result['content']}\n"
+                for result in results_dict["results"]
+            ]
+        )
+    else:
+        search_tool = DuckDuckGoSearchResults()
+        results = search_tool.invoke(query)
     if results:
         return results
     else:
@@ -297,36 +421,13 @@ def visit_website(url: str) -> str:
 
 
 @tool
-def get_youtube_transcript(video_url: str, return_timestamps: bool = False) -> str:
-    """Fetches the transcript of a YouTube video.
-
-    Args:
-        video_url (str): The URL of the YouTube video.
-        return_timestamps (bool): If True, returns timestamps with the transcript. Otherwise, returns only the text.
-    """
-    try:
-        video_id = video_url.split("v=")[-1]
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        if return_timestamps:
-            sentences = []
-            for t in transcript:
-                start = t["start"]
-                end = start + t["duration"]
-                sentences.append(f"{start:.2f} - {end:.2f}: {t['text']}")
-            return "\n".join(sentences)
-        else:
-            return "\n".join([t["text"] for t in transcript])
-    except Exception as e:
-        return f"Error fetching transcript: {e}"
-
-
-@tool
 def get_youtube_video_info(video_url: str) -> str:
-    """Fetches information about a YouTube video.
+    """Fetches information about a YouTube video and its transcript if it is available.
 
     Args:
         video_url (str): The URL of the YouTube video.
     """
+    # Get information about the video using yt-dlp
     try:
         ydl_opts = {
             "quiet": True,
@@ -347,9 +448,36 @@ def get_youtube_video_info(video_url: str) -> str:
         video_info_str = "\n".join(
             [f"{k}: {v}" for k, v in video_info_filtered.items()]
         )
-        return video_info_str
     except Exception as e:
-        return f"Error fetching video info: {e}"
+        print(f"Error fetching video info: {e}")
+        video_info_str = ""
+    try:
+        video_id = video_url.split("v=")[-1]
+        ytt_api = YouTubeTranscriptApi()
+        # We could add the option to load the transcript in a specific language
+        transcript = ytt_api.fetch(video_id)
+        sentences = []
+        for t in transcript:
+            start = t.start
+            end = start + t.duration
+            sentences.append(f"{start:.2f} - {end:.2f}: {t.text}")
+        transcript_with_timestamps = "\n".join(sentences)
+    except Exception as e:
+        print(f"Error fetching transcript: {e}")
+        transcript_with_timestamps = ""
+
+    # Check if neither piece of data was fetched
+    if not video_info_str and not transcript_with_timestamps:
+        return "Could not fetch video information or transcript."
+
+    # Use fallbacks for whichever is missing
+    info = video_info_str or "Video information not available."
+    transcript_section = (
+        f"\n\nTranscript:\n{transcript_with_timestamps}"
+        if transcript_with_timestamps
+        else "\n\nTranscript not available."
+    )
+    return f"{info}{transcript_section}"
 
 
 def encode_image(image_path):
@@ -403,6 +531,7 @@ def ask_about_image(image_path: str, question: str) -> str:
     return response.text()
 
 
+@tool
 def transcribe_audio(audio_path: str) -> str:
     """Transcribes audio to text.
 
@@ -411,7 +540,7 @@ def transcribe_audio(audio_path: str) -> str:
     """
     model = whisper.load_model("base")
     result = model.transcribe(audio_path)
-    text = result.text
+    text = result.get("text")
     return text
 
 
@@ -448,9 +577,8 @@ def get_table_description(table: pd.DataFrame) -> str:
 
 @tool
 def inspect_file_as_text(file_path: str) -> str:
-    """This tool reads a file as markdown text. It handles [".csv", ".xlsx", ".pptx", ".wav",
-    ".mp3", ".m4a", ".flac", ".pdf", ".docx"], and all other types of text files. IT DOES NOT
-    HANDLE IMAGES.
+    """This tool reads a file as markdown text. It handles [".csv", ".xlsx", ".pptx", ".pdf", ".docx"],
+    and all other types of text files. IT DOES NOT HANDLE IMAGES.
 
     Args:
         file_path (str): The path to the file you want to read as text. If it is an image, use `vision_qa` tool.
@@ -462,7 +590,11 @@ def inspect_file_as_text(file_path: str) -> str:
             raise Exception(
                 "Cannot use inspect_file_as_text tool with images: use `vision_qa` tool instead!"
             )
-        if suffix in [".csv", ".tsv", ".xlsx"]:
+        elif suffix in [".mp3", ".wav", ".flac", ".m4a"]:
+            raise Exception(
+                "Cannot use inspect_file_as_text tool with audio files: use `transcribe_audio` tool instead!"
+            )
+        elif suffix in [".csv", ".tsv", ".xlsx"]:
             if suffix == ".csv":
                 df = pd.read_csv(file_path)
             elif suffix == ".tsv":
@@ -482,8 +614,6 @@ def inspect_file_as_text(file_path: str) -> str:
         elif suffix == ".docx":
             doc = UnstructuredWordDocumentLoader(file_path)
             return doc.load()[0].page_content
-        elif suffix in [".wav", ".mp3", ".m4a", ".flac"]:
-            return transcribe_audio(file_path)
         else:
             # All other text files
             with open(file_path, "r", encoding="utf-8") as file:

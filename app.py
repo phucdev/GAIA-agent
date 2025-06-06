@@ -36,7 +36,10 @@ def solve_question(question: Dict[str, str]) -> Dict[str, str]:
     augmented_question = prompt_template["user_prompt"] + question_text
     if question.get("file_name"):
         file_url = DEFAULT_API_URL + "/files"
-        response = requests.get(f"{file_url}/{question['file_name']}", timeout=15)
+        response = requests.get(f"{file_url}/{question['task_id']}", timeout=15)
+        # Check if the request was successful
+        if response.status_code != 200:
+            raise ValueError(f"Failed to fetch file for task {task_id}: {response.status_code} - {response.text}")
         file_path = Path("files") / question["file_name"]
         # Create files directory if it doesn't exist
         file_path.parent.mkdir(parents=True, exist_ok=True)
