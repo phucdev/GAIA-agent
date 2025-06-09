@@ -1,42 +1,30 @@
 import base64
 import json
 import os
-import re
-from typing import Optional, Dict
-
 import pandas as pd
+import re
 import requests
 import whisper
 
-from bs4 import BeautifulSoup
 from datetime import datetime
 from dotenv import find_dotenv, load_dotenv
 from langchain.chains import RetrievalQA
 from langchain.chat_models import init_chat_model
-from langchain.schema import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import (
     UnstructuredPDFLoader, UnstructuredPowerPointLoader,
     UnstructuredWordDocumentLoader, WebBaseLoader)
-from langchain_community.tools import DuckDuckGoSearchResults, GoogleSearchResults
+from langchain_community.tools import DuckDuckGoSearchResults
 from langchain_community.utilities import GoogleSerperAPIWrapper
-from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
-from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 from langchain_tavily import TavilySearch
-from markdownify import markdownify as md
+from typing import Optional
 from youtube_transcript_api import YouTubeTranscriptApi
 from yt_dlp import YoutubeDL
 
+from retrieval import build_retriever, create_retrieval_qa
+from web_utilities import get_wikipedia_article, parse_sections, fetch_wikipedia_page, MarkdownWebBaseLoader
 
-UNWANTED_SECTIONS = {
-    "references",
-    "external links",
-    "further reading",
-    "see also",
-    "notes",
-}
 
 @tool
 def get_weather_info(location: str) -> str:
@@ -147,153 +135,6 @@ def reverse_text(text: str) -> str:
     return text[::-1]
 
 
-def build_retriever(text: str):
-    """Builds a retriever from the given text.
-
-    Args:
-        text (str): The text to be used for retrieval.
-    """
-    splitter = RecursiveCharacterTextSplitter(
-        separators=["\n### ", "\n## ", "\n# "],
-        chunk_size=1000,
-        chunk_overlap=200,
-    )
-    chunks = splitter.split_text(text)
-    docs = [
-        Document(page_content=chunk)
-        for chunk in chunks
-    ]
-    hf_embed = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
-    index = FAISS.from_documents(docs, hf_embed)
-    return index.as_retriever(search_kwargs={"k": 3})
-
-
-def get_retrieval_qa(text: str):
-    """Creates a RetrievalQA instance for the given text.
-    Args:
-        text (str): The text to be used for retrieval.
-    """
-    retriever = build_retriever(text)
-    llm = init_chat_model("groq:meta-llama/llama-4-scout-17b-16e-instruct")
-    return RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        return_source_documents=True,
-    )
-
-
-def clean_html(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 1. Remove <script> & <style>
-    for tag in soup(["script", "style"]):
-        tag.decompose()
-
-    # 2. Drop whole <section> blocks whose first heading is unwanted
-    for sec in soup.find_all("section"):
-        h = sec.find(["h1","h2","h3","h4","h5","h6"])
-        if h and any(h.get_text(strip=True).lower().startswith(u) for u in UNWANTED_SECTIONS):
-            sec.decompose()
-
-    # 3. Additional filtering by CSS selector
-    for selector in [".toc", ".navbox", ".vertical-navbox", ".hatnote", ".reflist", ".mw-references-wrap"]:
-        for el in soup.select(selector):
-            el.decompose()
-
-    # 4. Isolate the main content container if present
-    main = soup.find("div", class_="mw-parser-output")
-    return str(main or soup)
-
-
-def fetch_page_markdown(page_key: str, lang: str="en") -> str:
-    """Fetches the page HTML and returns the <body> as Markdown.
-    Args:
-        page_key (str): The unique key of the Wikipedia page.
-        lang (str): The language code for the Wikipedia edition to fetch (default: "en").
-    """
-    url = f"https://api.wikimedia.org/core/v1/wikipedia/{lang}/page/{page_key}/html"
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-    html = clean_html(resp.text)    # Optional, but recommended: clean the HTML to remove unwanted sections
-
-    markdown = md(
-        html,
-        heading_style="ATX",
-        bullets="*+-",
-        table_infer_header=True,
-        strip=['a', 'span']
-    )
-    return markdown
-
-
-def get_wikipedia_article(query: str) -> Dict[str, str]:
-    """Fetches a Wikipedia article for a given query and returns its content in Markdown format.
-
-    Args:
-        query (str): The search query.
-    """
-    headers = {
-        'User-Agent': 'MyLLMAgent (llm_agent@example.com)'
-    }
-
-    # Step 1: Search
-    search_url = f"https://api.wikimedia.org/core/v1/wikipedia/en/search/page"
-    search_params = {'q': query, 'limit': 1}
-    search_response = requests.get(search_url, headers=headers, params=search_params, timeout=15)
-
-    if search_response.status_code != 200:
-        raise Exception(f"Search error: {search_response.status_code} - {search_response.text}")
-
-    results = search_response.json().get("pages", [])
-    if not results:
-        raise Exception(f"No results found for query: {query}")
-
-    page = results[0]
-    page_key = page["key"]
-
-    # Step 2: Get the wiki page, only keep relevant content and convert to Markdown
-    markdown = fetch_page_markdown(page_key)
-    return {
-        "page_key": page_key,
-        "markdown": markdown,
-    }
-
-
-def parse_sections(markdown_text: str) -> Dict[str, Dict]:
-    """
-    Parses markdown into a nested dict:
-    { section_title: {
-         "full": full_section_md,
-         "subsections": { sub_title: sub_md, ... }
-      }, ... }
-    """
-    # First split top-level sections
-    top_pat = re.compile(r"^##\s+(.*)$", re.MULTILINE)
-    top_matches = list(top_pat.finditer(markdown_text))
-    sections: Dict[str, Dict] = {}
-    for i, m in enumerate(top_matches):
-        sec_title = m.group(1).strip()
-        start = m.start()
-        end = top_matches[i+1].start() if i+1 < len(top_matches) else len(markdown_text)
-        sec_md = markdown_text[start:end].strip()
-
-        # Now split subsections within this block
-        sub_pat = re.compile(r"^###\s+(.*)$", re.MULTILINE)
-        subs: Dict[str, str] = {}
-        sub_matches = list(sub_pat.finditer(sec_md))
-        for j, sm in enumerate(sub_matches):
-            sub_title = sm.group(1).strip()
-            sub_start = sm.start()
-            sub_end = sub_matches[j+1].start() if j+1 < len(sub_matches) else len(sec_md)
-            subs[sub_title] = sec_md[sub_start:sub_end].strip()
-
-        sections[sec_title] = {"full": sec_md, "subsections": subs}
-    return sections
-
-
 @tool
 def wiki_search_qa(query: str, question: str) -> str:
     """Searches Wikipedia for a specific article and answers a question based on its content.
@@ -304,10 +145,13 @@ def wiki_search_qa(query: str, question: str) -> str:
     Args:
         query (str): A concise topic name with optional keywords, ideally matching the relevant Wikipedia page title.
         question (str): The question to answer using the article.
+    Returns:
+        str: The answer to the question based on the retrieved article.
     """
     article = get_wikipedia_article(query)
     markdown = article["markdown"]
-    qa = get_retrieval_qa(markdown)
+    retriever = build_retriever(markdown)
+    qa = create_retrieval_qa(retriever=retriever)
     return qa.invoke(question)
 
 
@@ -344,8 +188,8 @@ def wiki_get_section(
     Returns:
         Markdown string of either the entire section or just the named subsection.
     """
-    page_key = page_key.strip().replace(" ", "_")
-    markdown = fetch_page_markdown(page_key)
+    result_dict = fetch_wikipedia_page(page_key=page_key)
+    markdown = result_dict.get("markdown")
     sections = parse_sections(markdown)
 
     sec_info = sections.get(section)
@@ -368,7 +212,7 @@ def web_search(query: str, max_results: int = 5) -> str:
 
     Args:
         query (str): The search query.
-        max_results (int): The maximum number of results to return. Default is 5.
+        max_results (int): The maximum number of results to return. Default is 3.
     """
     if os.getenv("SERPER_API_KEY"):
         # Preferred choice: Use Google Serper API for search
@@ -400,6 +244,8 @@ def web_search(query: str, max_results: int = 5) -> str:
         search_tool = DuckDuckGoSearchResults()
         results = search_tool.invoke(query)
     if results:
+        # Clean up the results to remove any unnecessary spaces or newlines, e.g. \n\n\n
+        results = re.sub(r"\n{2,}", "\n", results.strip())
         return results
     else:
         return "No results found."
@@ -412,12 +258,12 @@ def visit_website(url: str) -> str:
     Args:
         url (str): The URL of the website to visit.
     """
-    loader = WebBaseLoader(url)
-    documents = loader.load()
-    if documents:
-        return documents[0].page_content
-    else:
-        return "No content found."
+    try:
+        page_content = MarkdownWebBaseLoader(url).load()[0].page_content
+        # Use retrieval chain if page_content is large
+        return page_content
+    except Exception as e:
+        return f"Could not retrieve website content. Error: {e}"
 
 
 @tool

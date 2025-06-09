@@ -148,7 +148,7 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
         )
     else:
         print(f"Running agent on {len(questions_data)} questions...")
-    for item in questions_data:
+    for item in filtered_questions_data:
         result = solve_question(item)
         results_log.append(result)
     with open(results_file_path, "w") as results_file:
