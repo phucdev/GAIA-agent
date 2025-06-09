@@ -14,25 +14,24 @@ hf_oauth_expiration_minutes: 480
 
 # 🧠 GAIA-Agent
 
-A **LLM agent** designed to solve the final assignment of the [HuggingFace Agents course](https://huggingface.co/agents-course).
-The assignment consists of 20 level 1 questions of the [GAIA benchmark](https://huggingface.co/datasets/andrewrreed/GAIA).
-This agent is built with [LangGraph](https://www.langchain.com/langgraph), [LangChain](https://www.langchain.com/), 
-and is tracked using [LangFuse](https://www.langfuse.com/). 
-It uses real-time web search, Wikipedia lookups, file parsing, image analysis, audio transcription to provide accurate answers.
+A general-purpose **LLM agent** built to solve the final assignment of the [Hugging Face Agents course](https://huggingface.co/agents-course), which consists of 20 Level 1 questions from the [GAIA benchmark](https://huggingface.co/datasets/andrewrreed/GAIA).
+
+The agent uses a variety of tools—web search, Wikipedia extraction, file parsing, audio transcription, and more—to gather evidence and reason through answers. It is built with [LangGraph](https://www.langchain.com/langgraph) and [LangChain](https://www.langchain.com/), and all interactions are tracked with [LangFuse](https://www.langfuse.com/).
+
 
 ## 🛠️ Technical Details
 
-| Component/ Tool     | Tech Used                                                                                                                                                            |
-|---------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Agent framework     | [LangGraph](https://www.langchain.com/langgraph) + [LangChain](https://www.langchain.com/)                                                                           |
-| LLM                 | [Meta LLaMA 4 Maverick 17B 128e](https://huggingface.co/meta-llama/Llama-4-Maverick-17B-128E-Instruct) via [Groq](https://groq.com/)                                 |
-| Web search          | [SerperAPI](https://serper.dev/), [requests](https://requests.readthedocs.io/en/latest/), [Playwright](https://playwright.dev/python/) for rendering JSON            |
-| HTML parsing        | [BeautifulSoup](https://www.crummy.com/software/BeautifulSoup/), [markdownify](https://github.com/matthewwithanm/python-markdownify) for converting HTML to Markdown |
-| Wikipedia           | [Wikimedia API](https://api.wikimedia.org/wiki/Core_REST_API)                                                                                                        |
-| File parsing        | [Unstructured](https://unstructured.io/) (for PDFs, PowerPoint, Word), [pandas](https://pandas.pydata.org/) (for CSV, TSV, Excel)                                    |
-| Audio transcription | [OpenAI Whisper base](https://github.com/openai/whisper)                                                                                                             |
-| Agent monitoring    | [LangFuse](https://www.langfuse.com/)                                                                                                                                |
-| UI / API            | [Gradio](https://www.gradio.app/) based on the [Final Assignment Template](https://huggingface.co/spaces/agents-course/First_agent_template)                         |
+| Component               | Technology                                                                                                                                                                  |
+|-------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Agent Framework**     | [LangGraph](https://www.langchain.com/langgraph) + [LangChain](https://www.langchain.com/)                                                                                  |
+| **LLM**                 | [Meta LLaMA 4 Maverick 17B 128E Instruct](https://huggingface.co/meta-llama/Llama-4-Maverick-17B-128E-Instruct) via [Groq](https://groq.com/)                               |
+| **Web Search**          | [SerperAPI](https://serper.dev/) (Google Search), [requests](https://docs.python-requests.org/), [Playwright](https://playwright.dev/python/) for dynamic content rendering |
+| **HTML Parsing**        | [BeautifulSoup](https://www.crummy.com/software/BeautifulSoup/), [markdownify](https://github.com/matthewwithanm/python-markdownify) to convert HTML to Markdown            |
+| **Wikipedia**           | [Wikimedia API](https://api.wikimedia.org/wiki/Core_REST_API)                                                                                                               |
+| **File Parsing**        | [Unstructured](https://unstructured.io/) (PDF, DOCX, PPTX), [pandas](https://pandas.pydata.org/) (CSV, TSV, XLSX)                                                           |
+| **Audio Transcription** | [OpenAI Whisper (base)](https://github.com/openai/whisper)                                                                                                                  |
+| **Monitoring**          | [LangFuse](https://www.langfuse.com/)                                                                                                                                       |
+| **Frontend UI**         | [Gradio](https://www.gradio.app/), based on the [Final Assignment Template](https://huggingface.co/spaces/agents-course/First_agent_template)                               |
 
 
 ## 🔐 Setup Instructions
@@ -58,7 +57,7 @@ It uses real-time web search, Wikipedia lookups, file parsing, image analysis, a
    playwright install
    sudo apt-get install libgtk-3-0
    ```
-5. Then you can run the app with:
+5. Run the app with:
     ```bash
     python app.py
     ```
