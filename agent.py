@@ -32,7 +32,7 @@ class BasicAgent:
             "- For images, use `ask_about_image` to analyze the image and answer questions about it.\n"
             "- You can search the web using `web_search` to find information not available in your training data and"
             "use `visit_website` to retrieve the website content.\n"
-            "- If you need to search for a wikipedia article, call `wiki_search`, parse `page_key` and `toc`, "
+            "- If you need to search for a specific wikipedia article, call `wiki_search_article`, parse `page_key` and `toc`, "
             "then only after this step call `wiki_get_section` to fetch exactly the section/subsection you need for answering. "
             "**Never** guess `page_key` or section names—always derive them from the previous tool's output.\n"
             "- For YouTube links you can use `get_youtube_video_info` to retrieve information and the transcript about a YouTube video.\n"
